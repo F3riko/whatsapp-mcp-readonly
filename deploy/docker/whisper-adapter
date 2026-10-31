@@ -1,0 +1,12 @@
+#!/bin/sh
+# Entry point named by --transcribe-bin. whatsapp-mcp runs it with a scrubbed
+# environment (PATH, LANG, TMPDIR, HF_HUB_OFFLINE only), so the CPU bound and
+# the offline guarantees are set here instead of inherited from the container.
+#
+# OMP_NUM_THREADS matches the 2 CPU limit in the ops compose fragment.
+OMP_NUM_THREADS=2
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+PYTHONNOUSERSITE=1
+export OMP_NUM_THREADS HF_HUB_OFFLINE TRANSFORMERS_OFFLINE PYTHONNOUSERSITE
+exec /opt/venv/bin/python -B -s /opt/whatsapp-mcp/whisper_adapter.py "$@"

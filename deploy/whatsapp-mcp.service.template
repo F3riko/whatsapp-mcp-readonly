@@ -1,0 +1,40 @@
+[Unit]
+Description=WhatsApp MCP Server (Hardened Read-Only Fork)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=whatsappmcp
+Group=whatsappmcp
+UMask=0077
+
+# Token provisioning: Loaded securely from an owner-only file or environment, never CLI argv
+EnvironmentFile=-/etc/whatsapp-mcp/service.env
+ExecStart=/usr/local/bin/whatsapp-mcp --http 127.0.0.1:8787 --token-file /etc/whatsapp-mcp/token --data-dir /var/lib/whatsapp-mcp
+
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing and security isolation
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Resource controls (CPU, memory, tasks/PIDs)
+CPUQuota=100%
+MemoryMax=512M
+TasksMax=64
+
+# Filesystem access boundaries
+ReadWritePaths=/var/lib/whatsapp-mcp
+ReadOnlyPaths=/etc/whatsapp-mcp

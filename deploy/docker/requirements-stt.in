@@ -1,0 +1,8 @@
+# Local speech-to-text runtime only. Locked with hashes in requirements-stt.txt:
+#   uv pip compile deploy/docker/requirements-stt.in --generate-hashes \
+#     --python-version 3.12 --python-platform aarch64-unknown-linux-gnu \
+#     -o deploy/docker/requirements-stt.txt
+faster-whisper==1.2.1
+# faster-whisper 1.2.1 calls av.open(..., metadata_errors=...), which av 19
+# removed. Verified failing on 19.0.2 and working on 18.x.
+av<19

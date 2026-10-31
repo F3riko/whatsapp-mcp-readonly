@@ -1,0 +1,72 @@
+name: Image
+
+# Builds the linux/arm64 container image from the exact commit, smoke tests it,
+# and on branch pushes publishes it to GHCR as an immutable-by-convention
+# sha-<commit> tag. Deployments must pin the printed digest, never a tag.
+on:
+  push:
+    branches: [main, "harden/**"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - deploy/docker/**
+      - tools/whisper_adapter.py
+      - go.mod
+      - go.sum
+      - cmd/**
+      - internal/**
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Name the image after the exact commit
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "COMMIT=$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: docker build --build-arg "VERSION=$COMMIT" -t "$IMAGE:sha-$COMMIT" .
+
+      - name: Smoke test the built image
+        run: deploy/docker/smoke.sh "$IMAGE:sha-$COMMIT" "$COMMIT"
+
+      - name: Publish and read back the digest
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$COMMIT"
+          docker logout ghcr.io
+          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$COMMIT" --format '{{json .Manifest}}' | jq -r .digest)
+          docker pull "$IMAGE@$digest" >/dev/null
+          platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$IMAGE@$digest")
+          [ "$platform" = linux/arm64 ] || { echo "unexpected platform $platform"; exit 1; }
+          {
+            echo "### Published image"
+            echo "- reference: \`$IMAGE@$digest\`"
+            echo "- tag: \`sha-$COMMIT\`"
+            echo "- platform: \`$platform\`"
+            echo "- source commit: \`$COMMIT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "PUBLISHED $IMAGE@$digest platform=$platform commit=$COMMIT"

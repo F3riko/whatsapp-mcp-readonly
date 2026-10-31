@@ -72,6 +72,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_jid, timestam
 CREATE INDEX IF NOT EXISTS idx_messages_time      ON messages(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_sender    ON messages(sender_jid, timestamp DESC);
 
+-- Durable tombstone table to prevent resurrected messages from late STT or history sync
+CREATE TABLE IF NOT EXISTS revocations (
+	chat_jid   TEXT    NOT NULL,
+	id         TEXT    NOT NULL,
+	revoked_at INTEGER NOT NULL,
+	PRIMARY KEY (chat_jid, id)
+);
+CREATE INDEX IF NOT EXISTS idx_revocations ON revocations(chat_jid, id);
+
 -- External-content FTS5 index over message bodies and voice transcripts.
 -- remove_diacritics 2 makes "Jose" match "José".
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
