@@ -32,6 +32,9 @@ type fakePairing struct {
 	qr         chan whatsmeow.QRChannelItem
 	qrErr      error
 	connectErr error
+	// onConnect, when set, runs inside Connect before it returns, so a test can
+	// make several things true at once by the time linking first waits.
+	onConnect func()
 	// pairPhone answers PairPhone. Nil means a fixed synthetic code.
 	pairPhone func(ctx context.Context) (string, error)
 
@@ -64,6 +67,9 @@ func (f *fakePairing) GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChan
 
 func (f *fakePairing) Connect() error {
 	f.record("Connect")
+	if f.onConnect != nil {
+		f.onConnect()
+	}
 	return f.connectErr
 }
 

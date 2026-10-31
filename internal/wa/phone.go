@@ -115,6 +115,11 @@ func (c *Client) LinkWithPhone(ctx context.Context, e164 string) (err error) {
 				continue
 			}
 			requested = true
+			// select picks at random when cancellation and this item are both
+			// ready; do not send a code request on a context that is already dead.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			linkCode, err := c.pair.PairPhone(ctx, digits, true, phoneClientType, phoneClientDisplay)
 			if err := ctx.Err(); err != nil {
 				return err

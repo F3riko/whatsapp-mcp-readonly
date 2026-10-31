@@ -387,6 +387,36 @@ func TestPhoneLinkCancelledBeforeReadinessNeverRequestsACode(t *testing.T) {
 	}
 }
 
+// Cancellation and the first readiness item can both be ready when linking
+// first waits, and select then chooses at random. The code request must not go
+// out on a dead context in either case.
+func TestPhoneLinkCancelledWithReadinessAlreadyBufferedNeverRequestsACode(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		f := newFakePairing()
+		c, out, _ := newLinkClient(f)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.onConnect = func() {
+			f.qr <- code("SYNTH-QR-1")
+			cancel()
+		}
+
+		err := startPhoneLink(ctx, c, synthPhone).result(t)
+		cancel()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run %d: error = %v, want context.Canceled", i, err)
+		}
+		if f.count("PairPhone") != 0 {
+			t.Fatalf("run %d: PairPhone was called on a cancelled context; calls: %v", i, f.callLog())
+		}
+		if out.String() != "" {
+			t.Fatalf("run %d: output was written: %q", i, out.String())
+		}
+		if f.count("Disconnect") != 1 {
+			t.Fatalf("run %d: Disconnect calls = %d, want 1", i, f.count("Disconnect"))
+		}
+	}
+}
+
 func TestPhoneLinkCancelledDuringPairPhoneShowsNoCode(t *testing.T) {
 	f := newFakePairing()
 	c, out, _ := newLinkClient(f)
@@ -408,6 +438,34 @@ func TestPhoneLinkCancelledDuringPairPhoneShowsNoCode(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), synthDigits) || strings.Contains(out.String(), "PAIR-CODE") {
 		t.Error("cancellation leaked the number or showed a code")
+	}
+	if f.count("Disconnect") != 1 {
+		t.Errorf("Disconnect calls = %d, want 1", f.count("Disconnect"))
+	}
+}
+
+func TestPhoneLinkCancelledDuringPairPhoneEvenIfTheProviderIgnoresItShowsNoCode(t *testing.T) {
+	f := newFakePairing()
+	c, out, _ := newLinkClient(f)
+	release := make(chan struct{})
+	f.pairPhone = func(context.Context) (string, error) {
+		<-release // ignores ctx entirely, then answers with a valid code
+		return "SYNTH-CODE", nil
+	}
+	f.qr <- code("SYNTH-QR-1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r := startPhoneLink(ctx, c, synthPhone)
+	f.waitForCall(t, r, "PairPhone")
+	cancel()
+	close(release)
+
+	if err := r.result(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if out.String() != "" {
+		t.Errorf("output after cancellation: %q", out.String())
 	}
 	if f.count("Disconnect") != 1 {
 		t.Errorf("Disconnect calls = %d, want 1", f.count("Disconnect"))
