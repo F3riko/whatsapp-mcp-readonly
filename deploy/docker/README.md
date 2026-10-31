@@ -74,10 +74,14 @@ started. Any other failure exits with the server's own status and is restarted
 normally. `docker stop` ends the idle container with exit 0.
 
 Pairing is a separate, deliberate, interactive step, run with the server stopped
-and a real terminal (the QR code is drawn on stderr, so do not capture it):
+and a real terminal (the QR code is drawn on stderr, so do not capture it). The
+QR code and the raw `QR-CODE:` line are a live linking credential, so the
+container must not write them to a log: `--log-driver none` is required, and
+`docker logs` will not work for this container by design.
 
 ```sh
-docker run --rm -it --network host --user 10001:10001 -v <data volume>:/data \
+docker run --rm -it --log-driver none --network host --user 10001:10001 \
+  -v <data volume>:/data \
   --entrypoint /usr/local/bin/whatsapp-mcp <image> login --data-dir /data \
   --device-name "WhatsApp MCP read-only"
 ```
