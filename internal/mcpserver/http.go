@@ -5,11 +5,20 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// Default limits for hardened HTTP transport.
+const (
+	DefaultMaxConcurrentRequests = 32
+	DefaultSessionTimeout        = 15 * time.Minute
+	DefaultToolTimeout           = 30 * time.Second
 )
 
 // NewToken makes a bearer token for the HTTP transport.
@@ -21,33 +30,69 @@ func NewToken() (string, error) {
 	return "wamcp_" + hex.EncodeToString(b), nil
 }
 
-// HTTPServer serves MCP over streamable HTTP, for clients that cannot launch a
-// local command. claude.ai and ChatGPT connect from their own servers rather
-// than from your browser, so they need a URL rather than a binary.
-//
-// A token is mandatory. There is no way to start this without one, because an
-// open endpoint here is an unauthenticated door into someone's entire WhatsApp
-// history.
-// publicHost, when non-empty, is the hostname this server is reached at from
-// outside, for example whatsapp.example.com. It is required whenever a reverse
-// proxy sits in front, and it is what makes that safe.
+// isLoopbackAddr verifies if an address binds to loopback interface.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+type requestLimiter struct {
+	sem chan struct{}
+}
+
+func newRequestLimiter(max int) *requestLimiter {
+	if max <= 0 {
+		max = DefaultMaxConcurrentRequests
+	}
+	return &requestLimiter{sem: make(chan struct{}, max)}
+}
+
+func (l *requestLimiter) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case l.sem <- struct{}{}:
+			defer func() { <-l.sem }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Server overloaded: too many active requests"}}`)
+		}
+	})
+}
+
+// HTTPServer serves MCP over streamable HTTP, strictly guarded for local or authenticated proxy use.
 func HTTPServer(srv *mcp.Server, addr, token, publicHost string) (*http.Server, error) {
+	return HTTPServerWithConcurrency(srv, addr, token, publicHost, DefaultMaxConcurrentRequests)
+}
+
+// HTTPServerWithConcurrency builds an HTTPServer with custom concurrency limit.
+func HTTPServerWithConcurrency(srv *mcp.Server, addr, token, publicHost string, maxConcurrent int) (*http.Server, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("refusing to serve HTTP without a token")
 	}
 
-	// The SDK rejects any non-loopback Host header when listening on loopback.
-	// That is DNS rebinding protection and it is right by default, but it also
-	// blocks the correct setup of a reverse proxy terminating TLS on a real
-	// hostname and forwarding to 127.0.0.1.
-	//
-	// Rather than switch the protection off, it is replaced below with a
-	// stricter check: the Host must equal exactly the one host we were told to
-	// answer on. The SDK's version allows any loopback name; this allows one
-	// name and nothing else.
+	if !isLoopbackAddr(addr) {
+		return nil, fmt.Errorf("refusing to bind HTTP server to non-loopback address %q in hardened private fork", addr)
+	}
+
 	opts := &mcp.StreamableHTTPOptions{
-		DisableLocalhostProtection: publicHost != "",
-		MaxRequestBodyBytes:        4 << 20,
+		DisableLocalhostProtection:   publicHost != "",
+		MaxRequestBodyBytes:          4 << 20, // 4MB maximum
+		SessionTimeout:               DefaultSessionTimeout,
+		PropagateRequestCancellation: true,
 	}
 
 	handler := mcp.NewStreamableHTTPHandler(
@@ -62,25 +107,27 @@ func HTTPServer(srv *mcp.Server, addr, token, publicHost string) (*http.Server, 
 		w.Write([]byte("ok"))
 	})
 
-	mux.Handle("/", requireHost(publicHost, requireToken(token, handler)))
+	limiter := newRequestLimiter(maxConcurrent)
+
+	// Wrap handler with concurrency limit, Host, Origin, and Token protections
+	guarded := limiter.wrap(requireHost(publicHost, requireOrigin(addr, publicHost, requireToken(token, handler))))
+	mux.Handle("/", guarded)
 
 	return &http.Server{
 		Addr:              addr,
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}, nil
 }
 
-// requireToken checks the bearer token in constant time, so a wrong guess
-// cannot be narrowed down by timing the reply.
+// requireToken checks the bearer token in constant time.
 func requireToken(token string, next http.Handler) http.Handler {
 	want := []byte(token)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The scheme is required. TrimPrefix does nothing when the prefix is
-		// absent, so trimming alone would accept a bare token with no scheme
-		// at all. Cut reports whether it was actually there.
 		raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		got := strings.TrimSpace(raw)
 
@@ -95,31 +142,104 @@ func requireToken(token string, next http.Handler) http.Handler {
 	})
 }
 
-// requireHost rejects any request whose Host header is not the one this server
-// was told to answer on.
-//
-// When a reverse proxy terminates TLS and forwards to loopback, the SDK's own
-// DNS rebinding protection has to be turned off, because it refuses every
-// non-loopback Host. This puts something stricter in its place: exactly one
-// accepted hostname rather than any loopback name.
-//
-// An empty want means no proxy is in front, so the SDK's protection is still
-// active and this is a no-op.
-func requireHost(want string, next http.Handler) http.Handler {
-	if want == "" {
-		return next
-	}
-	want = strings.ToLower(strings.TrimSpace(want))
+// requireHost enforces exact Host header matching against publicHost or loopback.
+func requireHost(publicHost string, next http.Handler) http.Handler {
+	publicHost = strings.ToLower(strings.TrimSpace(publicHost))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := strings.ToLower(r.Host)
-		if i := strings.LastIndex(host, ":"); i != -1 && !strings.Contains(host[i:], "]") {
-			host = host[:i] // strip the port, Host may carry one
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
 		}
-		if host != want {
+		host = strings.Trim(host, "[]")
+
+		allowed := false
+		if publicHost != "" {
+			allowed = (host == publicHost)
+		} else {
+			allowed = (host == "localhost" || host == "127.0.0.1" || host == "::1")
+		}
+
+		if !allowed {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireOrigin enforces strict canonical same-origin and trusted public HTTPS origin checks.
+func requireOrigin(bindAddr, publicHost string, next http.Handler) http.Handler {
+	publicHost = strings.ToLower(strings.TrimSpace(publicHost))
+	_, bindPort, _ := net.SplitHostPort(bindAddr)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			// Machine client without Origin header (curl, cli, stdio proxy) is permitted
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		u, err := url.Parse(origin)
+		if err != nil || u.Hostname() == "" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		// Reject malformed origins with userinfo, paths, queries, or fragments
+		if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		originHost := strings.ToLower(u.Hostname())
+		originHost = strings.Trim(originHost, "[]")
+		originPort := u.Port()
+		originScheme := strings.ToLower(u.Scheme)
+
+		if publicHost != "" {
+			// Strict trusted expected public HTTPS origin
+			if originScheme != "https" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			expHost, expPort, err := net.SplitHostPort(publicHost)
+			if err != nil {
+				expHost = publicHost
+				expPort = ""
+			}
+			expHost = strings.ToLower(strings.Trim(expHost, "[]"))
+
+			if originHost != expHost {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if expPort != "" && originPort != expPort {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if expPort == "" && originPort != "" && originPort != "443" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		} else {
+			// Pure loopback origin check: only allow localhost / 127.0.0.1 / ::1
+			if originScheme != "http" && originScheme != "https" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if originHost != "localhost" && originHost != "127.0.0.1" && originHost != "::1" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			// Enforce matching port if bind port is specified
+			if bindPort != "" && originPort != "" && originPort != bindPort {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }

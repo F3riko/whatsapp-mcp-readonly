@@ -56,7 +56,8 @@ var readOnly = &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}
 
 func boolPtr(b bool) *bool { return &b }
 
-// New builds the MCP server with every tool registered.
+// New builds the MCP server with only read tools registered.
+// In this read-only fork, all send/write tools are strictly omitted.
 func New(d Deps) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{
 		Name:    "whatsapp",
@@ -69,15 +70,7 @@ func New(d Deps) *mcp.Server {
 	registerListChats(s, d)
 	registerSearchContacts(s, d)
 	registerSessionStatus(s, d)
-	registerSendMessage(s, d)
 	registerDownloadMedia(s, d)
-	registerSendFile(s, d)
-	registerSendVoiceNote(s, d)
-	registerSendAudio(s, d)
-
-	if d.Voice != nil {
-		registerSpeakMessage(s, d)
-	}
 
 	return s
 }
@@ -106,7 +99,9 @@ func registerSearchMessages(s *mcp.Server, d Deps) {
 		Description: "Full text search across the whole WhatsApp history, ranked by relevance. Searches message text and voice note transcripts. Returns a highlighted snippet per hit so you can see why it matched without fetching the whole conversation.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchMessagesIn) (*mcp.CallToolResult, messagesOut, error) {
-		msgs, err := d.Store.Search(ctx, in.Query, in.ChatJID, in.Limit)
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+		msgs, err := d.Store.Search(toolCtx, in.Query, in.ChatJID, in.Limit)
 		if err != nil {
 			return nil, messagesOut{}, fmt.Errorf("search failed: %w", err)
 		}
@@ -129,6 +124,9 @@ func registerListMessages(s *mcp.Server, d Deps) {
 		Description: "List messages newest first, optionally filtered by chat and time range. Use this to read a conversation in order. Use search_messages when you are looking for something by content.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listMessagesIn) (*mcp.CallToolResult, messagesOut, error) {
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+
 		f := store.MessageFilter{ChatJID: in.ChatJID, Limit: in.Limit, Offset: in.Offset}
 
 		if in.Since != "" {
@@ -146,7 +144,7 @@ func registerListMessages(s *mcp.Server, d Deps) {
 			f.Until = &t
 		}
 
-		msgs, err := d.Store.ListMessages(ctx, f)
+		msgs, err := d.Store.ListMessages(toolCtx, f)
 		if err != nil {
 			return nil, messagesOut{}, fmt.Errorf("list failed: %w", err)
 		}
@@ -172,7 +170,9 @@ func registerListChats(s *mcp.Server, d Deps) {
 		Description: "List conversations, most recently active first, direct and group. Use this to find a chat_jid to pass to the other tools.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, chatsOut, error) {
-		chats, err := d.Store.ListChats(ctx, in.Query, in.Limit, in.Offset)
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+		chats, err := d.Store.ListChats(toolCtx, in.Query, in.Limit, in.Offset)
 		if err != nil {
 			return nil, chatsOut{}, fmt.Errorf("list chats failed: %w", err)
 		}
@@ -197,7 +197,9 @@ func registerSearchContacts(s *mcp.Server, d Deps) {
 		Description: "Find people by name or phone number. Searches the real contact list, including WhatsApp push names and business names, not just the names of chats.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchContactsIn) (*mcp.CallToolResult, contactsOut, error) {
-		c, err := d.Store.SearchContacts(ctx, in.Query, in.Limit)
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+		c, err := d.Store.SearchContacts(toolCtx, in.Query, in.Limit)
 		if err != nil {
 			return nil, contactsOut{}, fmt.Errorf("contact search failed: %w", err)
 		}
@@ -221,7 +223,9 @@ func registerSessionStatus(s *mcp.Server, d Deps) {
 		Description: "Report whether WhatsApp is linked and connected, how much history has synced, and whether sending is enabled. Call this first if anything is returning nothing, because history sync can take several minutes after a fresh pairing.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, statusOut, error) {
-		chats, msgs, err := d.Store.Counts(ctx)
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+		chats, msgs, err := d.Store.Counts(toolCtx)
 		if err != nil {
 			return nil, statusOut{}, err
 		}
@@ -329,7 +333,9 @@ func registerDownloadMedia(s *mcp.Server, d Deps) {
 		if in.ChatJID == "" || in.MessageID == "" {
 			return nil, downloadMediaOut{}, fmt.Errorf("chat_jid and message_id are both required")
 		}
-		path, err := d.Client.DownloadMedia(ctx, in.ChatJID, in.MessageID)
+		toolCtx, cancel := context.WithTimeout(ctx, DefaultToolTimeout)
+		defer cancel()
+		path, err := d.Client.DownloadMedia(toolCtx, in.ChatJID, in.MessageID)
 		if err != nil {
 			return nil, downloadMediaOut{}, err
 		}

@@ -121,11 +121,18 @@ func TestToolsAreAdvertisedWithAnnotations(t *testing.T) {
 
 	for _, want := range []string{
 		"search_messages", "list_messages", "list_chats",
-		"search_contacts", "session_status", "send_message",
-		"download_media", "send_file", "send_voice_note",
+		"search_contacts", "session_status", "download_media",
 	} {
 		if byName[want] == nil {
 			t.Errorf("tool %s is not advertised", want)
+		}
+	}
+
+	for _, prohibited := range []string{
+		"send_message", "send_file", "send_voice_note", "send_audio", "speak_message",
+	} {
+		if byName[prohibited] != nil {
+			t.Errorf("prohibited send tool %s must not be advertised in read-only fork", prohibited)
 		}
 	}
 
@@ -136,14 +143,6 @@ func TestToolsAreAdvertisedWithAnnotations(t *testing.T) {
 		}
 		if tool.OutputSchema == nil {
 			t.Error("search_messages should declare an output schema")
-		}
-	}
-	if tool := byName["send_message"]; tool != nil {
-		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint {
-			t.Error("send_message must not be annotated read-only")
-		}
-		if tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
-			t.Error("send_message should be annotated destructive")
 		}
 	}
 }
@@ -183,64 +182,56 @@ func TestSearchReturnsStructuredContent(t *testing.T) {
 	}
 }
 
-// The headline safety property: a default install cannot send.
+// The headline safety property: a read-only fork does not register send tools.
 func TestSendIsRefusedByDefault(t *testing.T) {
 	cs, fake, _ := session(t, false)
 
-	res := call(t, cs, "send_message", map[string]any{
-		"chat_jid": "a@s.whatsapp.net", "text": "hello", "confirm": true,
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "send_message",
+		Arguments: map[string]any{
+			"chat_jid": "a@s.whatsapp.net", "text": "hello", "confirm": true,
+		},
 	})
-	if !res.IsError {
-		t.Fatal("send should be refused when --allow-send was not passed")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("send_message must fail as unknown tool in read-only fork, got: %v", err)
 	}
 	if len(fake.sent) != 0 {
 		t.Fatalf("nothing should have been sent, got %v", fake.sent)
 	}
 }
 
-// Even with sending enabled, the first call is a preview.
+// In the read-only fork, send_message is not available regardless of parameters.
 func TestSendRequiresConfirmation(t *testing.T) {
 	cs, fake, _ := session(t, true)
 
-	res := call(t, cs, "send_message", map[string]any{
-		"chat_jid": "a@s.whatsapp.net", "text": "hello",
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "send_message",
+		Arguments: map[string]any{
+			"chat_jid": "a@s.whatsapp.net", "text": "hello",
+		},
 	})
-	if res.IsError {
-		t.Fatal("an unconfirmed send should preview, not error")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("send_message must fail as unknown tool in read-only fork, got: %v", err)
 	}
 	if len(fake.sent) != 0 {
 		t.Fatalf("preview must not send, got %v", fake.sent)
-	}
-
-	res = call(t, cs, "send_message", map[string]any{
-		"chat_jid": "a@s.whatsapp.net", "text": "hello", "confirm": true,
-	})
-	if res.IsError {
-		t.Fatal("a confirmed send should succeed")
-	}
-	if len(fake.sent) != 1 {
-		t.Fatalf("want exactly 1 send, got %v", fake.sent)
 	}
 }
 
 func TestSendRespectsAllowlist(t *testing.T) {
 	cs, fake, _ := session(t, true, "friend@s.whatsapp.net")
 
-	res := call(t, cs, "send_message", map[string]any{
-		"chat_jid": "stranger@s.whatsapp.net", "text": "hi", "confirm": true,
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "send_message",
+		Arguments: map[string]any{
+			"chat_jid": "friend@s.whatsapp.net", "text": "hi", "confirm": true,
+		},
 	})
-	if !res.IsError {
-		t.Fatal("a chat outside the allowlist must be refused")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("send_message must fail as unknown tool in read-only fork, got: %v", err)
 	}
-
-	res = call(t, cs, "send_message", map[string]any{
-		"chat_jid": "friend@s.whatsapp.net", "text": "hi", "confirm": true,
-	})
-	if res.IsError {
-		t.Fatal("a chat on the allowlist should be permitted")
-	}
-	if len(fake.sent) != 1 {
-		t.Fatalf("want 1 send, got %v", fake.sent)
+	if len(fake.sent) != 0 {
+		t.Fatalf("want 0 sends, got %v", fake.sent)
 	}
 }
 
@@ -310,11 +301,14 @@ func TestOggOpusDetectedFromHeaderNotName(t *testing.T) {
 func TestSendAudioRefusedByDefault(t *testing.T) {
 	cs, fake, _ := session(t, false)
 
-	res := call(t, cs, "send_audio", map[string]any{
-		"chat_jid": "a@s.whatsapp.net", "audio_base64": "T2dnUw==", "confirm": true,
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "send_audio",
+		Arguments: map[string]any{
+			"chat_jid": "a@s.whatsapp.net", "audio_base64": "T2dnUw==", "confirm": true,
+		},
 	})
-	if !res.IsError {
-		t.Fatal("send_audio must obey the same guard as send_message")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("send_audio must fail as unknown tool in read-only fork, got: %v", err)
 	}
 	if len(fake.sent) != 0 {
 		t.Fatalf("nothing should have been sent, got %v", fake.sent)
@@ -324,10 +318,13 @@ func TestSendAudioRefusedByDefault(t *testing.T) {
 func TestSendAudioRejectsBadBase64(t *testing.T) {
 	cs, _, _ := session(t, true)
 
-	res := call(t, cs, "send_audio", map[string]any{
-		"chat_jid": "a@s.whatsapp.net", "audio_base64": "not base64 at all !!!", "confirm": true,
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "send_audio",
+		Arguments: map[string]any{
+			"chat_jid": "a@s.whatsapp.net", "audio_base64": "not base64 at all !!!", "confirm": true,
+		},
 	})
-	if !res.IsError {
-		t.Fatal("invalid base64 should be an error, not a silent failure")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("send_audio must fail as unknown tool in read-only fork, got: %v", err)
 	}
 }

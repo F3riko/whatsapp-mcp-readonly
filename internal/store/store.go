@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite" // pure Go driver, so the binary cross-compiles
@@ -59,11 +60,192 @@ type Contact struct {
 	FullName     string `json:"full_name,omitempty"`
 }
 
+// EnsureSecureDir checks every directory component before any creation or chmod,
+// refuses symlinks in any ancestor component, verifies ownership against process EUID,
+// and ensures the final directory has 0700 permissions.
+func EnsureSecureDir(dir string) error {
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return fmt.Errorf("resolve abs directory %q: %w", dir, err)
+		}
+		dir = abs
+	}
+
+	// Step 1: Check existing ancestry before any mkdir/chmod.
+	// No ancestor component may be a symlink or a non-directory.
+	parts := strings.Split(dir, string(os.PathSeparator))
+	curr := ""
+	for i, part := range parts {
+		if i == 0 && part == "" {
+			curr = "/"
+		} else if curr == "/" {
+			curr = "/" + part
+		} else {
+			curr = curr + "/" + part
+		}
+
+		fi, err := os.Lstat(curr)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Once a component does not exist, subsequent ones also do not exist yet.
+				// All existing ancestors were verified safe.
+				break
+			}
+			return fmt.Errorf("stat directory component %q: %w", curr, err)
+		}
+
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("directory component %q is a symlink, which is prohibited", curr)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("directory component %q is not a directory", curr)
+		}
+	}
+
+	// Step 2: Create directory if it does not exist
+	if _, err := os.Lstat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create data directory %q: %w", dir, err)
+		}
+		// Re-validate ancestry after creation to ensure no symlink race occurred
+		curr = ""
+		for i, part := range parts {
+			if i == 0 && part == "" {
+				curr = "/"
+			} else if curr == "/" {
+				curr = "/" + part
+			} else {
+				curr = curr + "/" + part
+			}
+			fi, err := os.Lstat(curr)
+			if err != nil {
+				return fmt.Errorf("stat directory component %q after creation: %w", curr, err)
+			}
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("directory component %q is a symlink after creation, which is prohibited", curr)
+			}
+			if !fi.IsDir() {
+				return fmt.Errorf("directory component %q is not a directory after creation", curr)
+			}
+		}
+	}
+
+	// Step 3: Validate the final service directory properties
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat data directory %q: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("data directory %q is a symlink, which is prohibited", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("data directory %q is not a directory", dir)
+	}
+
+	// Owner check: current EUID must own the final service directory
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+		euid := uint32(os.Geteuid())
+		if stat.Uid != euid {
+			return fmt.Errorf("data directory %q is owned by uid %d, expected %d", dir, stat.Uid, euid)
+		}
+	}
+
+	// Permissions check: ensure private 0700 modes, check errors
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("chmod data directory %q: %w", dir, err)
+		}
+	}
+
+	return nil
+}
+
+// EnsureSecureDatabaseFile verifies directory ancestry, ownership, and permissions,
+// rejects symlinks for data directories, DB files, and auxiliary WAL/SHM files,
+// and ensures restrictive 0700/0600 permissions.
+func EnsureSecureDatabaseFile(path string) error {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve abs db path %q: %w", path, err)
+		}
+		path = abs
+	}
+	dir := filepath.Dir(path)
+
+	// Validate directory ancestry and permissions
+	if err := EnsureSecureDir(dir); err != nil {
+		return err
+	}
+
+	euid := uint32(os.Geteuid())
+
+	// Validate DB file
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("database file %q is a symlink, which is prohibited", path)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("database file %q is not a regular file", path)
+		}
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if stat.Uid != euid {
+				return fmt.Errorf("database file %q is owned by uid %d, expected %d", path, stat.Uid, euid)
+			}
+		}
+		if fi.Mode().Perm()&0o077 != 0 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				return fmt.Errorf("chmod database file %q: %w", path, err)
+			}
+		}
+	} else if os.IsNotExist(err) {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return fmt.Errorf("create database file %q: %w", path, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close database file %q: %w", path, err)
+		}
+	} else {
+		return fmt.Errorf("stat database file %q: %w", path, err)
+	}
+
+	// Validate auxiliary files if they exist
+	for _, ext := range []string{"-wal", "-shm"} {
+		aux := path + ext
+		if fi, err := os.Lstat(aux); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("database auxiliary file %q is a symlink, which is prohibited", aux)
+			}
+			if !fi.Mode().IsRegular() {
+				return fmt.Errorf("database auxiliary file %q is not a regular file", aux)
+			}
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				if stat.Uid != euid {
+					return fmt.Errorf("database auxiliary file %q is owned by uid %d, expected %d", aux, stat.Uid, euid)
+				}
+			}
+			if fi.Mode().Perm()&0o077 != 0 {
+				if err := os.Chmod(aux, 0o600); err != nil {
+					return fmt.Errorf("chmod database auxiliary file %q: %w", aux, err)
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("stat database auxiliary file %q: %w", aux, err)
+		}
+	}
+
+	return nil
+}
+
 // Open opens the database at path, creating it and its parent directory if
-// needed, and applies the schema.
+// needed, verifies directory security, sets 0600 file permissions, and applies the schema.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("create data directory: %w", err)
+	if err := EnsureSecureDatabaseFile(path); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
@@ -78,6 +260,38 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("chmod database file %q: %w", path, err)
+	}
+	for _, ext := range []string{"-wal", "-shm"} {
+		aux := path + ext
+		if fi, err := os.Lstat(aux); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				db.Close()
+				return nil, fmt.Errorf("database auxiliary file %q is a symlink, which is prohibited", aux)
+			}
+			if !fi.Mode().IsRegular() {
+				db.Close()
+				return nil, fmt.Errorf("database auxiliary file %q is not a regular file", aux)
+			}
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				euid := uint32(os.Geteuid())
+				if stat.Uid != euid {
+					db.Close()
+					return nil, fmt.Errorf("database auxiliary file %q is owned by uid %d, expected %d", aux, stat.Uid, euid)
+				}
+			}
+			if err := os.Chmod(aux, 0o600); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("chmod database auxiliary file %q: %w", aux, err)
+			}
+		} else if !os.IsNotExist(err) {
+			db.Close()
+			return nil, fmt.Errorf("stat database auxiliary file %q: %w", aux, err)
+		}
 	}
 
 	return &Store{db: db}, nil
@@ -127,21 +341,59 @@ type StoredMessage struct {
 
 // UpsertMessage records a message. Re-delivery of the same ID updates rather
 // than duplicating, which matters because history sync and live events overlap.
+// If a durable tombstone exists for this message, the message is ignored to prevent resurrection.
+// The tombstone check is performed atomically within the single insert statement.
 func (s *Store) UpsertMessage(ctx context.Context, m StoredMessage) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO messages (
 			id, chat_jid, sender_jid, content, timestamp, is_from_me, msg_type,
 			quoted_id, media_type, filename, media_url, media_key, file_sha256,
 			file_enc_sha256, file_length, media_path, transcript
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		)
+		SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM revocations WHERE chat_jid = ? AND id = ?
+		)
 		ON CONFLICT(chat_jid, id) DO UPDATE SET
 			content    = CASE WHEN excluded.content    <> '' THEN excluded.content    ELSE messages.content    END,
 			media_path = CASE WHEN excluded.media_path <> '' THEN excluded.media_path ELSE messages.media_path END,
 			transcript = CASE WHEN excluded.transcript <> '' THEN excluded.transcript ELSE messages.transcript END`,
 		m.ID, m.ChatJID, m.SenderJID, m.Content, m.Timestamp.Unix(), m.IsFromMe,
 		m.MsgType, m.QuotedID, m.MediaType, m.Filename, m.MediaURL, m.MediaKey,
-		m.FileSHA256, m.FileEncSHA, m.FileLength, m.MediaPath, m.Transcript)
+		m.FileSHA256, m.FileEncSHA, m.FileLength, m.MediaPath, m.Transcript,
+		m.ChatJID, m.ID)
 	return err
+}
+
+// UpdateTranscript updates the transcript of an existing, non-revoked message.
+// It never creates or resurrects a message row.
+func (s *Store) UpdateTranscript(ctx context.Context, chatJID, messageID, transcript string) error {
+	if transcript == "" {
+		return nil
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE messages
+		SET transcript = ?
+		WHERE chat_jid = ? AND id = ? AND deleted = 0
+		  AND NOT EXISTS (
+			SELECT 1 FROM revocations WHERE chat_jid = ? AND id = ?
+		  )`,
+		transcript, chatJID, messageID, chatJID, messageID)
+	if err != nil {
+		return fmt.Errorf("update transcript: %w", err)
+	}
+	return nil
+}
+
+// IsRevoked reports whether a message ID in a chat has a durable tombstone.
+func (s *Store) IsRevoked(ctx context.Context, chatJID, messageID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM revocations WHERE chat_jid = ? AND id = ?`, chatJID, messageID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // selectMessage is the shared projection. sender_name prefers the address book
@@ -420,10 +672,16 @@ func (s *Store) GetMedia(ctx context.Context, chatJID, messageID string) (Media,
 
 // SetMediaPath records where a downloaded attachment landed, so a second
 // request returns the existing file instead of downloading it again.
+// It will never update a deleted or revoked message.
 func (s *Store) SetMediaPath(ctx context.Context, chatJID, messageID, path string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET media_path = ? WHERE chat_jid = ? AND id = ?`,
-		path, chatJID, messageID)
+		`UPDATE messages
+		SET media_path = ?
+		WHERE chat_jid = ? AND id = ? AND deleted = 0
+		  AND NOT EXISTS (
+			SELECT 1 FROM revocations WHERE chat_jid = ? AND id = ?
+		  )`,
+		path, chatJID, messageID, chatJID, messageID)
 	return err
 }
 
@@ -542,4 +800,37 @@ func (s *Store) LastInteraction(ctx context.Context, chatJID string) (*Message, 
 		return nil, fmt.Errorf("no messages stored for %s", chatJID)
 	}
 	return &msgs[0], nil
+}
+
+// DeleteMessage deletes a message from messages and its FTS index, recording a durable tombstone,
+// and returning any cached media_path.
+func (s *Store) DeleteMessage(ctx context.Context, chatJID, messageID string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin delete tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Record durable tombstone so late STT / history redelivery cannot recreate it
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO revocations (chat_jid, id, revoked_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(chat_jid, id) DO NOTHING`,
+		chatJID, messageID, now); err != nil {
+		return "", fmt.Errorf("record revocation tombstone: %w", err)
+	}
+
+	var mediaPath string
+	_ = tx.QueryRowContext(ctx, `SELECT media_path FROM messages WHERE chat_jid = ? AND id = ?`, chatJID, messageID).Scan(&mediaPath)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE chat_jid = ? AND id = ?`, chatJID, messageID); err != nil {
+		return "", fmt.Errorf("delete message: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit delete tx: %w", err)
+	}
+
+	return mediaPath, nil
 }

@@ -4,6 +4,9 @@ package wa
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,11 +27,12 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	"github.com/thenavidm/whatsapp-mcp/internal/agent"
 	"github.com/thenavidm/whatsapp-mcp/internal/store"
 	"github.com/thenavidm/whatsapp-mcp/internal/transcribe"
-	"github.com/thenavidm/whatsapp-mcp/internal/voice"
 )
+
+// ErrReadOnly is returned by all send operations in this hardened read-only fork.
+var ErrReadOnly = errors.New("read-only fork: sending messages is disabled")
 
 // How much backlog to ask WhatsApp for during pairing. The defaults deliver
 // about one message per chat, which builds a list but cannot be searched.
@@ -37,10 +41,15 @@ const (
 	historySyncSizeMB = 4096
 )
 
+type mediaDownloader interface {
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+}
+
 // Client is a linked WhatsApp Web device backed by a message store.
 type Client struct {
-	wm *whatsmeow.Client
-	st *store.Store
+	wm         *whatsmeow.Client
+	downloader mediaDownloader
+	st         *store.Store
 
 	// out is where pairing instructions and the QR code are drawn.
 	//
@@ -52,7 +61,8 @@ type Client struct {
 	out io.Writer
 
 	// stt is optional. When nil, voice notes are stored but not transcribed.
-	stt transcribe.Transcriber
+	stt      transcribe.Transcriber
+	sttQueue *transcribe.Queue
 
 	// dataDir is where downloaded attachments are written.
 	dataDir string
@@ -61,15 +71,23 @@ type Client struct {
 	// itself rather than relying on the terminal drawing.
 	qrCodes chan<- string
 
-	// responder, when set, answers messages in one designated chat by itself.
-	responder *agent.Responder
-
-	// speaker, when set, lets an automatic reply come back as a voice note.
-	speaker voice.Speaker
-
 	mu        sync.RWMutex
 	connected bool
 	syncing   bool
+
+	// Media publication and revoke serialization
+	mediaPubRevokeMu sync.Mutex
+
+	// Shared download admission semaphore across MCP media and STT
+	initMu      sync.Mutex
+	downloadSem chan struct{}
+
+	// Media disk cache quota
+	quotaMu            sync.Mutex
+	usedCacheBytes     int64
+	reservedCacheBytes int64
+	cacheScanned       bool
+	maxCacheBytes      int64
 }
 
 // Options configures a client.
@@ -86,10 +104,6 @@ type Options struct {
 	Transcriber transcribe.Transcriber
 	// QRCodes, when set, receives each pairing code as it is issued.
 	QRCodes chan<- string
-	// Responder answers messages in one chat automatically. Optional.
-	Responder *agent.Responder
-	// Speaker lets automatic replies be spoken. Optional.
-	Speaker voice.Speaker
 	// DeviceName is what shows under Linked Devices on the phone. Defaults to
 	// "WhatsApp MCP". WhatsApp shows "Other device" when a client sends
 	// nothing, which is what happens by default.
@@ -106,8 +120,8 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		out = os.Stderr
 	}
 
-	if err := os.MkdirAll(opts.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create data directory: %w", err)
+	if err := store.EnsureSecureDir(opts.DataDir); err != nil {
+		return nil, fmt.Errorf("secure data directory: %w", err)
 	}
 
 	// Identify ourselves before the client is built. WhatsApp reads these
@@ -149,6 +163,9 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	// The session database holds the linked device's Signal keys. It is
 	// credentials, so it lives 0700 alongside the message store.
 	sessionPath := filepath.Join(opts.DataDir, "session.db")
+	if err := store.EnsureSecureDatabaseFile(sessionPath); err != nil {
+		return nil, fmt.Errorf("secure session store: %w", err)
+	}
 	container, err := sqlstore.New(ctx, "sqlite", "file:"+sessionPath+"?_pragma=foreign_keys(1)", logger)
 	if err != nil {
 		return nil, fmt.Errorf("open session store: %w", err)
@@ -159,18 +176,32 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		return nil, fmt.Errorf("load device: %w", err)
 	}
 
-	c := &Client{
-		wm:        whatsmeow.NewClient(device, logger),
-		st:        opts.Store,
-		out:       out,
-		stt:       opts.Transcriber,
-		dataDir:   opts.DataDir,
-		qrCodes:   opts.QRCodes,
-		responder: opts.Responder,
-		speaker:   opts.Speaker,
+	var sttQ *transcribe.Queue
+	if opts.Transcriber != nil {
+		sttQ = transcribe.NewQueue(opts.Transcriber, transcribe.QueueConfig{})
 	}
+
+	c := &Client{
+		wm:       whatsmeow.NewClient(device, logger),
+		st:       opts.Store,
+		out:      out,
+		stt:      opts.Transcriber,
+		sttQueue: sttQ,
+		dataDir:  opts.DataDir,
+		qrCodes:  opts.QRCodes,
+	}
+	c.downloader = c.wm
+	c.wm.SetMediaHTTPClient(newBoundedMediaHTTPClient(MaxMediaDownloadBytes))
 	c.wm.AddEventHandler(c.handleEvent)
 	return c, nil
+}
+
+// ServeConnect is used during normal server execution and refuses unpaired sessions.
+func (c *Client) ServeConnect(ctx context.Context) error {
+	if c.wm == nil || c.wm.Store == nil || c.wm.Store.ID == nil {
+		return fmt.Errorf("whatsapp session is not paired; run 'whatsapp-mcp login' interactively to pair a device")
+	}
+	return c.Connect(ctx)
 }
 
 // Connect links the device, showing a QR code if this is a first pairing, and
@@ -233,8 +264,15 @@ func (c *Client) Connect(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// Disconnect closes the connection.
-func (c *Client) Disconnect() { c.wm.Disconnect() }
+// Disconnect closes the connection and shuts down the inference worker.
+func (c *Client) Disconnect() {
+	if c.sttQueue != nil {
+		c.sttQueue.Close()
+	}
+	if c.wm != nil {
+		c.wm.Disconnect()
+	}
+}
 
 // Status reports connection health, for the session health tool.
 type Status struct {
@@ -257,9 +295,6 @@ func (c *Client) Status() Status {
 	s := Status{Connected: c.connected, Syncing: c.syncing}
 	if c.stt != nil {
 		s.Transcription = c.stt.Name()
-	}
-	if c.responder != nil {
-		s.AutoReply = c.responder.Describe()
 	}
 	if id := c.wm.Store.ID; id != nil {
 		s.Paired = true
@@ -322,10 +357,215 @@ func (c *Client) setSyncing(v bool) {
 	c.mu.Unlock()
 }
 
+// isViewOnceOrEphemeral detects explicit view-once or disappearing ephemeral payloads,
+// recursing through edited and device-sent wrappers, and inspecting ephemeral context metadata.
+//
+// Limitations: Only inspects declared protobuf wrappers and ephemeral fields; does not decrypt
+// out-of-band ephemeral server policy changes when not present on the message payload.
+func isViewOnceOrEphemeral(msg *waE2E.Message) bool {
+	return isViewOnceOrEphemeralRecurse(msg, 0)
+}
+
+func isViewOnceOrEphemeralRecurse(msg *waE2E.Message, depth int) bool {
+	if msg == nil || depth > 10 {
+		return false
+	}
+	if msg.GetViewOnceMessage() != nil ||
+		msg.GetViewOnceMessageV2() != nil ||
+		msg.GetViewOnceMessageV2Extension() != nil ||
+		msg.GetEphemeralMessage() != nil {
+		return true
+	}
+	if img := msg.GetImageMessage(); img != nil && (img.GetViewOnce() || checkContextEphemeral(img.GetContextInfo())) {
+		return true
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && (vid.GetViewOnce() || checkContextEphemeral(vid.GetContextInfo())) {
+		return true
+	}
+	if aud := msg.GetAudioMessage(); aud != nil && (aud.GetViewOnce() || checkContextEphemeral(aud.GetContextInfo())) {
+		return true
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && checkContextEphemeral(doc.GetContextInfo()) {
+		return true
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil && checkContextEphemeral(ext.GetContextInfo()) {
+		return true
+	}
+
+	// Recurse through wrappers
+	if e := msg.GetEditedMessage(); e != nil && e.GetMessage() != nil {
+		if isViewOnceOrEphemeralRecurse(e.GetMessage(), depth+1) {
+			return true
+		}
+	}
+	if d := msg.GetDeviceSentMessage(); d != nil && d.GetMessage() != nil {
+		if isViewOnceOrEphemeralRecurse(d.GetMessage(), depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkContextEphemeral(ci *waE2E.ContextInfo) bool {
+	if ci == nil {
+		return false
+	}
+	return ci.GetExpiration() > 0 || ci.GetEphemeralSettingTimestamp() > 0
+}
+
+func (c *Client) getDownloadSem() chan struct{} {
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+	if c.downloadSem == nil {
+		c.downloadSem = make(chan struct{}, MaxConcurrentMediaDownloads)
+	}
+	return c.downloadSem
+}
+
+func (c *Client) acquireDownloadSlot() (func(), error) {
+	sem := c.getDownloadSem()
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				<-sem
+			})
+		}, nil
+	default:
+		return nil, ErrDownloadOverload
+	}
+}
+
+func (c *Client) reserveMediaSpace(needed int64) (func(success bool, actualBytes int64), error) {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+
+	if !c.cacheScanned {
+		mediaRoot := filepath.Clean(filepath.Join(c.dataDir, "media"))
+		var total int64
+		if entries, err := os.ReadDir(mediaRoot); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					if info, err := entry.Info(); err == nil && info.Mode().IsRegular() {
+						total += info.Size()
+					}
+				}
+			}
+		}
+		c.usedCacheBytes = total
+		c.cacheScanned = true
+	}
+
+	maxQuota := c.maxCacheBytes
+	if maxQuota <= 0 {
+		maxQuota = MaxMediaCacheBytes
+	}
+
+	if c.usedCacheBytes+c.reservedCacheBytes+needed > maxQuota {
+		return nil, ErrMediaCacheFull
+	}
+
+	c.reservedCacheBytes += needed
+	return func(success bool, actualBytes int64) {
+		c.quotaMu.Lock()
+		defer c.quotaMu.Unlock()
+		c.reservedCacheBytes -= needed
+		if success && actualBytes > 0 {
+			c.usedCacheBytes += actualBytes
+		}
+	}, nil
+}
+
+func (c *Client) removeMediaByMessageID(chatJID, messageID string) {
+	mediaRoot := filepath.Clean(filepath.Join(c.dataDir, "media"))
+	h := sha256.Sum256([]byte(chatJID + "\x00" + messageID))
+	prefix := hex.EncodeToString(h[:])
+	entries, err := os.ReadDir(mediaRoot)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			c.safeRemoveMedia(filepath.Join(mediaRoot, entry.Name()))
+		}
+	}
+}
+
+func (c *Client) safeRemoveMedia(path string) {
+	if path == "" {
+		return
+	}
+	mediaRoot := filepath.Clean(filepath.Join(c.dataDir, "media"))
+	cleanPath := filepath.Clean(path)
+
+	// Validate mediaRoot itself is not a symlink
+	if rootFi, err := os.Lstat(mediaRoot); err != nil || rootFi.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+
+	rel, err := filepath.Rel(mediaRoot, cleanPath)
+	if err != nil || strings.HasPrefix(rel, "..") || strings.HasPrefix(rel, "/") || rel == "." {
+		return // Outside mediaRoot
+	}
+
+	// Verify no directory component in rel is a symlink
+	curr := mediaRoot
+	parts := strings.Split(rel, string(os.PathSeparator))
+	for i := 0; i < len(parts)-1; i++ {
+		curr = filepath.Join(curr, parts[i])
+		fi, err := os.Lstat(curr)
+		if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return // Parent component is a symlink or invalid
+		}
+	}
+
+	if fi, err := os.Lstat(cleanPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return // Prohibit unlinking symlink targets
+		}
+		if !fi.Mode().IsRegular() {
+			return
+		}
+		size := fi.Size()
+		if err := os.Remove(cleanPath); err == nil {
+			c.quotaMu.Lock()
+			c.usedCacheBytes -= size
+			if c.usedCacheBytes < 0 {
+				c.usedCacheBytes = 0
+			}
+			c.quotaMu.Unlock()
+		}
+	}
+}
+
 // onMessage persists a live incoming or outgoing message.
 func (c *Client) onMessage(ctx context.Context, evt *events.Message) {
 	chatJID := evt.Info.Chat.ToNonAD().String()
 	if isNotAConversation(chatJID) {
+		return
+	}
+
+	// Process revoke target by deleting original message, FTS entry, and media
+	if pm := evt.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_REVOKE {
+		targetID := ""
+		if key := pm.GetKey(); key != nil {
+			targetID = key.GetID()
+		}
+		if targetID != "" {
+			c.mediaPubRevokeMu.Lock()
+			mediaPath, err := c.st.DeleteMessage(ctx, chatJID, targetID)
+			if err == nil && mediaPath != "" {
+				c.safeRemoveMedia(mediaPath)
+			}
+			c.removeMediaByMessageID(chatJID, targetID)
+			c.mediaPubRevokeMu.Unlock()
+		}
+		return
+	}
+
+	// Strictly suppress view-once and ephemeral payloads from ingestion
+	if isViewOnceOrEphemeral(evt.Message) {
 		return
 	}
 
@@ -368,45 +608,9 @@ func (c *Client) onMessage(ctx context.Context, evt *events.Message) {
 
 	isVoice := evt.Message.GetAudioMessage() != nil
 
-	// Answer the designated chat automatically.
-	//
-	// Only inbound messages trigger it. Without that check, the reply we send
-	// arrives back through this same handler and triggers another reply, and
-	// the two sides talk to each other forever.
-	shouldAnswer := !evt.Info.IsFromMe && c.responder.Handles(chatJID)
-
-	switch {
-	case isVoice && c.stt != nil:
-		// Transcribe FIRST, then answer with the words. Running these in
-		// parallel means the agent sees the placeholder "[voice note]" and
-		// replies to that instead of to what was actually said.
-		go func() {
-			text := c.transcribeVoiceNote(evt)
-			if shouldAnswer {
-				if strings.TrimSpace(text) == "" {
-					_, _ = c.SendText(context.Background(), chatJID,
-						"I could not make out that voice note. Could you type it?")
-					return
-				}
-				c.autoReplyWith(chatJID, text, true)
-			}
-		}()
-
-	case isVoice && c.stt == nil && shouldAnswer:
-		// A voice note with no transcription configured cannot be answered,
-		// and saying so is better than replying to a placeholder.
-		go func() {
-			_, _ = c.SendText(context.Background(), chatJID,
-				"I can only read text right now. Transcription is not switched on for voice notes.")
-		}()
-
-	default:
-		if c.stt != nil && isVoice {
-			go c.transcribeVoiceNote(evt)
-		}
-		if shouldAnswer {
-			go c.autoReplyWith(chatJID, sm.Content, false)
-		}
+	// Synchronously enqueue voice note without spawning goroutines or downloading
+	if isVoice && c.sttQueue != nil {
+		c.enqueueVoiceNote(evt)
 	}
 
 	if evt.Info.PushName != "" && !evt.Info.IsFromMe {
@@ -423,7 +627,7 @@ func (c *Client) onMessage(ctx context.Context, evt *events.Message) {
 // caption counts as text. Missing one of these is how history ends up full of
 // blank rows.
 func ExtractText(msg *waE2E.Message) string {
-	if msg == nil {
+	if msg == nil || isViewOnceOrEphemeral(msg) {
 		return ""
 	}
 	switch {
@@ -441,22 +645,13 @@ func ExtractText(msg *waE2E.Message) string {
 		return msg.GetDocumentMessage().GetFileName()
 	}
 
-	// Wrapped payloads. An edited or view-once message hides the real body a
-	// level down.
+	// Wrapped payloads. An edited message hides the real body a level down.
+	// View-once and ephemeral payloads are strictly omitted.
 	if e := msg.GetEditedMessage(); e != nil {
 		return ExtractText(e.GetMessage())
 	}
-	if v := msg.GetViewOnceMessage(); v != nil {
-		return ExtractText(v.GetMessage())
-	}
-	if v := msg.GetViewOnceMessageV2(); v != nil {
-		return ExtractText(v.GetMessage())
-	}
 	if d := msg.GetDeviceSentMessage(); d != nil {
 		return ExtractText(d.GetMessage())
-	}
-	if e := msg.GetEphemeralMessage(); e != nil {
-		return ExtractText(e.GetMessage())
 	}
 	if r := msg.GetReactionMessage(); r != nil {
 		return r.GetText()
@@ -566,6 +761,9 @@ func messageType(msg *waE2E.Message) string {
 // fillMedia records what is needed to fetch an attachment later, without
 // downloading it now.
 func fillMedia(sm *store.StoredMessage, msg *waE2E.Message) {
+	if isViewOnceOrEphemeral(msg) {
+		return
+	}
 	switch {
 	case msg.GetImageMessage() != nil:
 		m := msg.GetImageMessage()
@@ -612,6 +810,32 @@ func (c *Client) onHistorySync(ctx context.Context, evt *events.HistorySync) {
 			if wm == nil {
 				continue
 			}
+			msg := wm.GetMessage()
+			if msg == nil {
+				continue
+			}
+
+			// Handle history revoke controls as well as live
+			if pm := msg.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_REVOKE {
+				targetID := ""
+				if key := pm.GetKey(); key != nil {
+					targetID = key.GetID()
+				}
+				if targetID != "" {
+					c.mediaPubRevokeMu.Lock()
+					mediaPath, err := c.st.DeleteMessage(ctx, jid, targetID)
+					if err == nil && mediaPath != "" {
+						c.safeRemoveMedia(mediaPath)
+					}
+					c.removeMediaByMessageID(jid, targetID)
+					c.mediaPubRevokeMu.Unlock()
+				}
+				continue
+			}
+
+			if isViewOnceOrEphemeral(msg) {
+				continue
+			}
 			info := wm.GetKey()
 			ts := time.Unix(int64(wm.GetMessageTimestamp()), 0)
 			if ts.After(newest) {
@@ -627,12 +851,12 @@ func (c *Client) onHistorySync(ctx context.Context, evt *events.HistorySync) {
 				ID:        info.GetID(),
 				ChatJID:   jid,
 				SenderJID: sender,
-				Content:   ExtractText(wm.GetMessage()),
+				Content:   ExtractText(msg),
 				Timestamp: ts,
 				IsFromMe:  info.GetFromMe(),
-				MsgType:   messageType(wm.GetMessage()),
+				MsgType:   messageType(msg),
 			}}
-			fillMedia(&sm, wm.GetMessage())
+			fillMedia(&sm, msg)
 			_ = c.st.UpsertMessage(ctx, sm)
 		}
 
@@ -646,71 +870,64 @@ func (c *Client) onHistorySync(ctx context.Context, evt *events.HistorySync) {
 }
 
 // SendText sends a plain text message and returns the new message ID.
+// In this hardened read-only fork, it unconditionally rejects sends.
 func (c *Client) SendText(ctx context.Context, chatJID, text string) (string, error) {
-	jid, err := types.ParseJID(chatJID)
-	if err != nil {
-		return "", fmt.Errorf("%q is not a valid chat id: %w", chatJID, err)
-	}
-
-	resp, err := c.wm.SendMessage(ctx, jid, &waE2E.Message{Conversation: &text})
-	if err != nil {
-		return "", err
-	}
-
-	// Record our own message immediately so the next read reflects it.
-	_ = c.st.UpsertMessage(ctx, store.StoredMessage{Message: store.Message{
-		ID:        resp.ID,
-		ChatJID:   jid.ToNonAD().String(),
-		Content:   text,
-		Timestamp: resp.Timestamp,
-		IsFromMe:  true,
-		MsgType:   "text",
-	}})
-	return resp.ID, nil
+	return "", ErrReadOnly
 }
 
-// transcribeVoiceNote downloads a voice note, decrypts it and stores the text.
-//
-// This runs on its own goroutine because transcription of a long note takes
-// far longer than an event handler should block for, and a slow provider must
-// never stall the WhatsApp connection.
-//
-// Failure is deliberately quiet. A voice note that cannot be transcribed is
-// still stored and still readable; only the search text is missing, and an
-// error here must not lose the message.
-func (c *Client) transcribeVoiceNote(evt *events.Message) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+// enqueueVoiceNote synchronously enqueues a voice note for download and transcription.
+// Single worker performs download, inference, and persistence sequentially with backpressure,
+// avoiding RAM and download storms.
+func (c *Client) enqueueVoiceNote(evt *events.Message) {
+	if c.sttQueue == nil {
+		return
+	}
 
 	audio := evt.Message.GetAudioMessage()
-	data, err := c.wm.Download(ctx, audio)
-	if err != nil {
-		fmt.Fprintf(c.out, "transcription: could not fetch voice note %s: %v\n", evt.Info.ID, err)
-		return ""
+	if audio == nil {
+		return
 	}
 
-	// WhatsApp voice notes are Ogg Opus, which every supported provider
-	// accepts directly. No conversion and no ffmpeg needed on this path.
-	text, err := c.stt.Transcribe(ctx, data, "voice-note.ogg")
-	if err != nil {
-		fmt.Fprintf(c.out, "transcription failed for %s: %v\n", evt.Info.ID, err)
-		return ""
-	}
-	if strings.TrimSpace(text) == "" {
-		return ""
+	declaredSize := audio.GetFileLength()
+	if declaredSize > transcribe.DefaultMaxAudioBytes {
+		fmt.Fprintf(c.out, "transcription: voice note %s declared size %d exceeds limit\n", evt.Info.ID, declaredSize)
+		return
 	}
 
-	// Writing the transcript fires the FTS trigger, so it becomes searchable
-	// with no further work.
-	_ = c.st.UpsertMessage(ctx, store.StoredMessage{
-		Message: store.Message{
-			ID:        evt.Info.ID,
-			ChatJID:   evt.Info.Chat.ToNonAD().String(),
-			Timestamp: evt.Info.Timestamp,
+	chatJID := evt.Info.Chat.ToNonAD().String()
+	msgID := evt.Info.ID
+
+	job := &transcribe.Job{
+		ChatJID:      chatJID,
+		MessageID:    msgID,
+		Filename:     "voice-note.ogg",
+		DeclaredSize: declaredSize,
+		Download: func(ctx context.Context) ([]byte, error) {
+			releaseSlot, err := c.acquireDownloadSlot()
+			if err != nil {
+				return nil, err
+			}
+			defer releaseSlot()
+
+			if c.downloader != nil {
+				return c.downloader.Download(ctx, audio)
+			}
+			if c.wm != nil {
+				return c.wm.Download(ctx, audio)
+			}
+			return nil, errors.New("downloader is nil")
 		},
-		Transcript: text,
-	})
-	return text
+		OnSuccess: func(ctx context.Context, text string) error {
+			if strings.TrimSpace(text) == "" {
+				return nil
+			}
+			return c.st.UpdateTranscript(ctx, chatJID, msgID, text)
+		},
+	}
+
+	if err := c.sttQueue.Submit(context.Background(), job); err != nil {
+		fmt.Fprintf(c.out, "transcription queue submit for %s: %v\n", msgID, err)
+	}
 }
 
 // SyncContacts copies WhatsApp's own contact list into the store.
@@ -780,49 +997,4 @@ func isNotAConversation(jid string) bool {
 		return true
 	}
 	return strings.HasSuffix(jid, "@newsletter")
-}
-
-// autoReply runs the configured command and sends its output back.
-//
-// Runs on its own goroutine because a model can take a minute to answer, and
-// blocking here would stall every other message arriving meanwhile.
-func (c *Client) autoReplyWith(chatJID, text string, spoken bool) {
-	if strings.TrimSpace(text) == "" {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	// Show the typing indicator, so a slow answer looks like thinking rather
-	// than like being ignored.
-	if jid, err := types.ParseJID(chatJID); err == nil {
-		_ = c.wm.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText)
-		defer func() {
-			_ = c.wm.SendChatPresence(ctx, jid, types.ChatPresencePaused, types.ChatPresenceMediaText)
-		}()
-	}
-
-	reply := c.responder.Reply(ctx, text)
-	if strings.TrimSpace(reply) == "" {
-		return
-	}
-
-	// Reply in kind. A voice note deserves a voice note back, and reading a
-	// wall of text after speaking is a worse experience than hearing an
-	// answer. Falls back to text if speech fails, because a written reply
-	// beats silence.
-	if spoken && c.speaker != nil {
-		if ogg, err := c.speaker.Speak(ctx, reply); err == nil {
-			if _, err := c.SendVoiceBytes(ctx, chatJID, ogg); err == nil {
-				return
-			}
-		} else {
-			fmt.Fprintf(c.out, "auto-reply could not speak, falling back to text: %v\n", err)
-		}
-	}
-
-	if _, err := c.SendText(ctx, chatJID, reply); err != nil {
-		fmt.Fprintf(c.out, "auto-reply could not send: %v\n", err)
-	}
 }
