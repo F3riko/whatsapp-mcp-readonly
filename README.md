@@ -89,6 +89,8 @@ The input must be one international E.164 number (a `+`, a non-zero country code
 7 to 15 digits in all) with at most one trailing newline. Spaces, punctuation,
 local formats and anything longer than 32 bytes are rejected, without being
 echoed, before any file or network is touched. The country is never guessed.
+`--phone-stdin` is a bare flag: a value such as `--phone-stdin=...` is refused
+with a fixed message that does not repeat it.
 
 The command prints one line, `PAIR-CODE: XXXX-XXXX`, on stderr. On the phone open
 WhatsApp, then Settings, Linked Devices, Link a Device, and choose **Link with

@@ -37,7 +37,7 @@ Usage:
   whatsapp-mcp [flags]          Serve read-only MCP over stdio (default)
   whatsapp-mcp login            Link device via interactive QR terminal display and exit
   whatsapp-mcp login --phone-stdin
-                                Link by phone number instead of a QR code (see below)
+                                Link with a pairing code for a phone number read from stdin
   whatsapp-mcp version          Print the version
 
 General flags:
@@ -46,17 +46,10 @@ General flags:
   --debug               Verbose protocol logging on stderr
 
 Phone-number linking (login only):
-  --phone-stdin         Read ONE international E.164 number (a '+', the country code, then the
-                        number, digits only) from stdin and link with a pairing code instead of a
-                        QR code. The number is never accepted as an argument or environment
-                        variable. Stdin must be a pipe or file that ends (at most 32 bytes); a
-                        single trailing newline is allowed and anything else is rejected without
-                        being echoed. Cannot be combined with --debug.
-                        A single line 'PAIR-CODE: XXXX-XXXX' is printed to stderr. In WhatsApp go to
-                        Settings, Linked Devices, Link a Device, then 'Link with phone number
-                        instead', and enter it. The code is a live linking credential and expires
-                        with the connection (about 160 seconds); a failed or expired attempt is not
-                        retried, run login again for a new code.
+  --phone-stdin         Read one E.164 number (a '+', country code, digits) from stdin, never from
+                        arguments or environment, and print 'PAIR-CODE: XXXX-XXXX' to stderr. Enter
+                        it under Linked Devices, 'Link with phone number instead'. The code is a
+                        live credential and expires with the connection. Not valid with --debug.
 
 Local transcription (optional, off by default):
   --transcribe local        Enable offline local transcription of voice notes
@@ -97,16 +90,16 @@ func run() error {
 // stdin and observe the login action without touching WhatsApp.
 type runEnv struct {
 	stdin io.Reader
-	// login links the device: by QR code when phone is empty, otherwise by
-	// the validated E.164 number.
+	// login links the device: by QR code when phone is empty, otherwise with
+	// the validated number.
 	login func(ctx context.Context, c *wa.Client, phone string) error
 }
 
 func defaultLogin(ctx context.Context, c *wa.Client, phone string) error {
-	if phone == "" {
-		return c.Connect(ctx)
+	if phone != "" {
+		return c.LinkWithPhone(ctx, phone)
 	}
-	return c.LinkWithPhone(ctx, phone)
+	return c.Connect(ctx)
 }
 
 func runArgs(ctx context.Context, rawArgs []string) error {
@@ -129,7 +122,7 @@ func runWith(ctx context.Context, rawArgs []string, env runEnv) error {
 	sendTo := fs.String("send-to", "", "comma separated chat ids (prohibited in read-only fork)")
 	rateLimit := fs.Int("rate-limit", 10, "maximum sends per minute")
 	debug := fs.Bool("debug", false, "verbose protocol logging")
-	phoneStdin := fs.Bool("phone-stdin", false, "login only: read one E.164 phone number from stdin and link with a pairing code instead of a QR code")
+	phoneStdin := fs.Bool("phone-stdin", false, "login only: link with a phone number read from stdin instead of a QR code")
 	deviceName := fs.String("device-name", "WhatsApp MCP", "name shown under Linked Devices on your phone")
 	httpAddr := fs.String("http", "", "serve MCP over HTTP at this address instead of stdio")
 	httpToken := fs.String("token", "", "bearer token (rejected: use --token-file or WHATSAPP_MCP_TOKEN)")
@@ -153,6 +146,15 @@ func runWith(ctx context.Context, rawArgs []string, env runEnv) error {
 		args = args[1:]
 	}
 
+	// --phone-stdin is a bare flag. Refuse any value before the flag package sees
+	// it: on a bad value it would print the value back, and the value may be a
+	// phone number.
+	for _, a := range rawArgs {
+		if strings.HasPrefix(a, "--phone-stdin=") || strings.HasPrefix(a, "-phone-stdin=") {
+			return fmt.Errorf("--phone-stdin takes no value; the number is read from stdin")
+		}
+	}
+
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
@@ -160,16 +162,14 @@ func runWith(ctx context.Context, rawArgs []string, env runEnv) error {
 		return err
 	}
 
-	// The number is only ever read from stdin, by login. Reject every other use
-	// here, before any store or client exists.
 	if *phoneStdin && command != "login" {
 		return fmt.Errorf("--phone-stdin is only valid with the login command")
 	}
-	if command == "login" && fs.NArg() > 0 {
-		return fmt.Errorf("login takes no positional arguments; a phone number is read from stdin with --phone-stdin, never from the command line")
-	}
 	if *phoneStdin && *debug {
-		return fmt.Errorf("--phone-stdin cannot be combined with --debug: protocol logging could record the phone number and pairing code")
+		return fmt.Errorf("--phone-stdin cannot be combined with --debug: protocol logging could record the number or the code")
+	}
+	if command == "login" && fs.NArg() > 0 {
+		return fmt.Errorf("login takes no positional arguments; the phone number is read from stdin with --phone-stdin")
 	}
 
 	switch command {
@@ -229,17 +229,15 @@ func runWith(ctx context.Context, rawArgs []string, env runEnv) error {
 		return fmt.Errorf("could not determine a home directory, pass --data-dir")
 	}
 
-	// Read and validate the number before anything is opened: a bad number must
-	// have no database, file or network side effect.
 	phone := ""
 	if *phoneStdin {
 		readCtx, cancel := context.WithTimeout(ctx, phoneInputTimeout)
-		var err error
-		phone, err = readPhoneStdin(readCtx, env.stdin)
+		n, err := readPhoneStdin(readCtx, env.stdin)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("--phone-stdin: %w", err)
 		}
+		phone = n
 	}
 
 	st, err := store.Open(filepath.Join(*dataDir, "messages.db"))
