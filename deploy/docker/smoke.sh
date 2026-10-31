@@ -13,10 +13,11 @@ data=wamcp-smoke-data-$sfx
 tok=wamcp-smoke-tok-$sfx
 tok_open=wamcp-smoke-tokopen-$sfx
 name=wamcp-smoke-$sfx
+phone_data=wamcp-smoke-phone-$sfx
 
 cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
-  docker volume rm "$data" "$tok" "$tok_open" >/dev/null 2>&1 || true
+  docker volume rm "$data" "$tok" "$tok_open" "$phone_data" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
@@ -38,6 +39,27 @@ if out=$(docker run --rm --network none "${hardening[@]}" --entrypoint /usr/loca
 fi
 [[ $out == *"sending is permanently disabled"* ]] || fail "unexpected --allow-send rejection text"
 ok "--allow-send rejected"
+
+# Phone-number linking is login-only and validated before anything is opened.
+# Nothing here pairs or reaches WhatsApp: --network none, a throwaway volume,
+# and only inputs that must be refused. The values are not real numbers.
+if out=$(docker run --rm --network none "${hardening[@]}" --entrypoint /usr/local/bin/whatsapp-mcp "$IMG" --phone-stdin 2>&1 </dev/null); then
+  fail "--phone-stdin was accepted outside login"
+fi
+[[ $out == *"only valid with the login command"* ]] || fail "unexpected --phone-stdin rejection text"
+docker volume create "$phone_data" >/dev/null
+rc=0
+out=$(printf 'not-a-phone-number\n' | docker run --rm -i --network none "${hardening[@]}" -v "$phone_data:/data" \
+  --entrypoint /usr/local/bin/whatsapp-mcp "$IMG" login --phone-stdin --data-dir /data 2>&1) || rc=$?
+[[ $rc -ne 0 ]] || fail "an invalid phone number was accepted"
+[[ $out == *"E.164"* ]] || fail "unexpected invalid-number rejection text"
+[[ $out != *not-a-phone-number* ]] || fail "the rejected input was echoed"
+[[ -z $(docker run --rm -v "$phone_data:/data" --entrypoint ls "$IMG" -A /data) ]] \
+  || fail "an invalid phone number left files in the data directory"
+if docker run --rm --network none "${hardening[@]}" --entrypoint /usr/local/bin/whatsapp-mcp "$IMG" login --phone 12345678 >/dev/null 2>&1; then
+  fail "a phone number was accepted on the command line"
+fi
+ok "--phone-stdin is login-only, validates before any setup, never echoes input, refuses argv numbers"
 
 docker volume create "$data" >/dev/null
 docker volume create "$tok" >/dev/null

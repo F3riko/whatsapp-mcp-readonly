@@ -54,7 +54,7 @@ It links to WhatsApp as a companion device (identical protocol to WhatsApp Web),
    - Enforces exact `Host` header matching and strict canonical `Origin` verification (rejecting cross-port, cross-scheme, or foreign origins).
    - Bearer authentication is required for HTTP and must be supplied via `--token-file` or `WHATSAPP_MCP_TOKEN` (passing tokens on CLI argv is rejected).
    - Concurrency is bounded with prompt HTTP 429 overload responses, finite session timeouts, and per-tool execution deadlines.
-   - Normal server startup refuses unpaired sessions; interactive QR pairing requires running `whatsapp-mcp login`.
+   - Normal server startup refuses unpaired sessions; pairing (QR code, or a phone number with `--phone-stdin`) requires running `whatsapp-mcp login` and can never start from normal serve.
 
 ---
 
@@ -76,7 +76,33 @@ Run the interactive pairing command once in a terminal to scan the QR code:
 ```bash
 ./bin/whatsapp-mcp login --data-dir ~/.whatsapp-mcp
 ```
-*(Note: Phone pairing remains an operational step performed by the device owner).*
+
+**Or link by phone number**, when you cannot scan a QR code. Only `login` accepts
+this, and only on stdin: the number is never an argument, an environment variable
+or a file, so it stays out of your shell history and the process table.
+```bash
+read -rs -p 'Number to link, as +<country code><number>: ' PHONE; echo
+printf '%s\n' "$PHONE" | ./bin/whatsapp-mcp login --phone-stdin --data-dir ~/.whatsapp-mcp
+unset PHONE
+```
+The input must be one international E.164 number (a `+`, a non-zero country code,
+7 to 15 digits in all) with at most one trailing newline. Spaces, punctuation,
+local formats and anything longer than 32 bytes are rejected, without being
+echoed, before any file or network is touched. The country is never guessed.
+`--phone-stdin` is a bare flag: a value such as `--phone-stdin=...` is refused
+with a fixed message that does not repeat it.
+
+The command prints one line, `PAIR-CODE: XXXX-XXXX`, on stderr. On the phone open
+WhatsApp, then Settings, Linked Devices, Link a Device, and choose **Link with
+phone number instead**; enter the code there (no SMS is involved, see
+<https://faq.whatsapp.com/1324084875126592>). Exactly one code is requested per
+run. It lives as long as the connection, about 160 seconds; if it expires, the run
+fails and you start again for a new code. The code is a live linking credential:
+do not paste it anywhere, and do not run this where output is recorded. The
+command refuses a data directory that is already linked, never unlinks one, and
+cannot be combined with `--debug` (protocol logs could record the number).
+
+Pairing remains an operational step performed by the device owner.
 
 ### 2. Run over stdio (Recommended for Claude Code / local agents)
 Configure your client to launch the binary:

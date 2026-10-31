@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -35,12 +36,20 @@ const usage = `whatsapp-mcp - Hardened read-only WhatsApp MCP server for AI agen
 Usage:
   whatsapp-mcp [flags]          Serve read-only MCP over stdio (default)
   whatsapp-mcp login            Link device via interactive QR terminal display and exit
+  whatsapp-mcp login --phone-stdin
+                                Link with a pairing code for a phone number read from stdin
   whatsapp-mcp version          Print the version
 
 General flags:
   --data-dir PATH       Where session.db and messages.db live (default: ~/.whatsapp-mcp)
   --device-name NAME    Device name under Linked Devices (default: "WhatsApp MCP")
   --debug               Verbose protocol logging on stderr
+
+Phone-number linking (login only):
+  --phone-stdin         Read one E.164 number (a '+', country code, digits) from stdin, never from
+                        arguments or environment, and print 'PAIR-CODE: XXXX-XXXX' to stderr. Enter
+                        it under Linked Devices, 'Link with phone number instead'. The code is a
+                        live credential and expires with the connection. Not valid with --debug.
 
 Local transcription (optional, off by default):
   --transcribe local        Enable offline local transcription of voice notes
@@ -77,7 +86,27 @@ func run() error {
 	return runArgs(ctx, os.Args[1:])
 }
 
+// runEnv is what runWith needs from the outside world, so tests can supply
+// stdin and observe the login action without touching WhatsApp.
+type runEnv struct {
+	stdin io.Reader
+	// login links the device: by QR code when phone is empty, otherwise with
+	// the validated number.
+	login func(ctx context.Context, c *wa.Client, phone string) error
+}
+
+func defaultLogin(ctx context.Context, c *wa.Client, phone string) error {
+	if phone != "" {
+		return c.LinkWithPhone(ctx, phone)
+	}
+	return c.Connect(ctx)
+}
+
 func runArgs(ctx context.Context, rawArgs []string) error {
+	return runWith(ctx, rawArgs, runEnv{stdin: os.Stdin, login: defaultLogin})
+}
+
+func runWith(ctx context.Context, rawArgs []string, env runEnv) error {
 	defaultDir := ""
 	if home, err := os.UserHomeDir(); err == nil {
 		defaultDir = filepath.Join(home, ".whatsapp-mcp")
@@ -93,6 +122,7 @@ func runArgs(ctx context.Context, rawArgs []string) error {
 	sendTo := fs.String("send-to", "", "comma separated chat ids (prohibited in read-only fork)")
 	rateLimit := fs.Int("rate-limit", 10, "maximum sends per minute")
 	debug := fs.Bool("debug", false, "verbose protocol logging")
+	phoneStdin := fs.Bool("phone-stdin", false, "login only: link with a phone number read from stdin instead of a QR code")
 	deviceName := fs.String("device-name", "WhatsApp MCP", "name shown under Linked Devices on your phone")
 	httpAddr := fs.String("http", "", "serve MCP over HTTP at this address instead of stdio")
 	httpToken := fs.String("token", "", "bearer token (rejected: use --token-file or WHATSAPP_MCP_TOKEN)")
@@ -116,11 +146,30 @@ func runArgs(ctx context.Context, rawArgs []string) error {
 		args = args[1:]
 	}
 
+	// --phone-stdin is a bare flag. Refuse any value before the flag package sees
+	// it: on a bad value it would print the value back, and the value may be a
+	// phone number.
+	for _, a := range rawArgs {
+		if strings.HasPrefix(a, "--phone-stdin=") || strings.HasPrefix(a, "-phone-stdin=") {
+			return fmt.Errorf("--phone-stdin takes no value; the number is read from stdin")
+		}
+	}
+
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
 		return err
+	}
+
+	if *phoneStdin && command != "login" {
+		return fmt.Errorf("--phone-stdin is only valid with the login command")
+	}
+	if *phoneStdin && *debug {
+		return fmt.Errorf("--phone-stdin cannot be combined with --debug: protocol logging could record the number or the code")
+	}
+	if command == "login" && fs.NArg() > 0 {
+		return fmt.Errorf("login takes no positional arguments; the phone number is read from stdin with --phone-stdin")
 	}
 
 	switch command {
@@ -180,6 +229,17 @@ func runArgs(ctx context.Context, rawArgs []string) error {
 		return fmt.Errorf("could not determine a home directory, pass --data-dir")
 	}
 
+	phone := ""
+	if *phoneStdin {
+		readCtx, cancel := context.WithTimeout(ctx, phoneInputTimeout)
+		n, err := readPhoneStdin(readCtx, env.stdin)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("--phone-stdin: %w", err)
+		}
+		phone = n
+	}
+
 	st, err := store.Open(filepath.Join(*dataDir, "messages.db"))
 	if err != nil {
 		return err
@@ -225,7 +285,7 @@ func runArgs(ctx context.Context, rawArgs []string) error {
 	defer client.Disconnect()
 
 	if command == "login" {
-		if err := client.Connect(ctx); err != nil {
+		if err := env.login(ctx, client, phone); err != nil {
 			return err
 		}
 		fmt.Fprintln(os.Stderr, "Linked. You can now add this server to your AI client.")

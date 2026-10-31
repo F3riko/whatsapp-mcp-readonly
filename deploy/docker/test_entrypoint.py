@@ -142,6 +142,22 @@ class EntrypointTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("ran version", out)
 
+    def test_login_phone_stdin_is_exec_ed_with_stdin_intact_and_no_preflight(self):
+        # A synthetic marker, never a real number: the fake app records what it
+        # was given so the test can prove stdin reaches it untouched.
+        seen = self.root / "seen"
+        app = self.fake_app(f'echo "$*" > {seen}.argv\ncat > {seen}.stdin\n')
+        proc = subprocess.Popen(
+            [sys.executable, "-c", DRIVER, app, "login", "--phone-stdin", "--data-dir", str(self.data)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        out, err = proc.communicate("+10000000000\n", timeout=20)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(Path(f"{seen}.argv").read_text().strip(), f"login --phone-stdin --data-dir {self.data}")
+        self.assertEqual(Path(f"{seen}.stdin").read_text(), "+10000000000\n")
+        self.assertNotIn("preflight", err)
+        self.assertNotIn("+10000000000", out + err)
+
 
 if __name__ == "__main__":
     unittest.main()
