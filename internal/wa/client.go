@@ -48,6 +48,7 @@ type mediaDownloader interface {
 // Client is a linked WhatsApp Web device backed by a message store.
 type Client struct {
 	wm         *whatsmeow.Client
+	pair       pairingAPI
 	downloader mediaDownloader
 	st         *store.Store
 
@@ -70,6 +71,9 @@ type Client struct {
 	// qrCodes, when set, receives each pairing code so a caller can render it
 	// itself rather than relying on the terminal drawing.
 	qrCodes chan<- string
+
+	// handshakeWait waits out the post-pairing handshake. Nil means time.After.
+	handshakeWait func(time.Duration) <-chan time.Time
 
 	mu        sync.RWMutex
 	connected bool
@@ -190,6 +194,7 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		dataDir:  opts.DataDir,
 		qrCodes:  opts.QRCodes,
 	}
+	c.pair = waPairing{c.wm}
 	c.downloader = c.wm
 	c.wm.SetMediaHTTPClient(newBoundedMediaHTTPClient(MaxMediaDownloadBytes))
 	c.wm.AddEventHandler(c.handleEvent)
@@ -204,22 +209,42 @@ func (c *Client) ServeConnect(ctx context.Context) error {
 	return c.Connect(ctx)
 }
 
+// handshakeGrace is how long to keep the connection open after WhatsApp
+// accepts a pairing, so the session it wrote becomes durable.
+const handshakeGrace = 15 * time.Second
+
+// pairingAPI is the slice of *whatsmeow.Client that linking drives. It is the
+// only thing the pairing tests replace.
+type pairingAPI interface {
+	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
+	Connect() error
+	Disconnect()
+	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
+	// LinkedID is the device's JID once paired, or nil.
+	LinkedID() *types.JID
+}
+
+// waPairing adapts a real whatsmeow client to pairingAPI.
+type waPairing struct{ *whatsmeow.Client }
+
+func (p waPairing) LinkedID() *types.JID { return p.Store.ID }
+
 // Connect links the device, showing a QR code if this is a first pairing, and
 // blocks until the connection is established or ctx is canceled.
 func (c *Client) Connect(ctx context.Context) error {
-	if c.wm.Store.ID != nil {
+	if c.pair.LinkedID() != nil {
 		// Already paired. Reconnect using the stored session.
-		if err := c.wm.Connect(); err != nil {
+		if err := c.pair.Connect(); err != nil {
 			return fmt.Errorf("reconnect: %w", err)
 		}
 		return nil
 	}
 
-	qrChan, err := c.wm.GetQRChannel(ctx)
+	qrChan, err := c.pair.GetQRChannel(ctx)
 	if err != nil {
 		return fmt.Errorf("qr channel: %w", err)
 	}
-	if err := c.wm.Connect(); err != nil {
+	if err := c.pair.Connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 
@@ -237,21 +262,10 @@ func (c *Client) Connect(ctx context.Context) error {
 			fmt.Fprintf(c.out, "\nQR-CODE: %s\n\n", evt.Code)
 			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, c.out)
 		case "success":
-			// Pairing is not finished when the code is accepted. WhatsApp
-			// completes the handshake over the live connection immediately
-			// afterwards, and the session it wrote is only durable once that
-			// lands. Returning here killed the process mid-handshake, so the
-			// phone dropped the device and the local row went stale.
-			fmt.Fprintln(c.out, "\nCode accepted. Finishing the handshake, this takes a few seconds.")
-			select {
-			case <-time.After(15 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
+			if err := c.finishPairing(ctx); err != nil {
+				return err
 			}
-			if c.wm.Store.ID == nil {
-				return fmt.Errorf("handshake did not complete, run the command again")
-			}
-			fmt.Fprintf(c.out, "Linked as %s.\nIt will now appear under Linked Devices on your phone.\n", c.wm.Store.ID.String())
+			fmt.Fprintf(c.out, "Linked as %s.\nIt will now appear under Linked Devices on your phone.\n", c.pair.LinkedID().String())
 			return nil
 		case "timeout":
 			return fmt.Errorf("pairing timed out, run the command again")
@@ -262,6 +276,30 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// finishPairing runs after WhatsApp accepts a pairing, for both QR and phone
+// linking.
+//
+// Pairing is not finished when the code is accepted. WhatsApp completes the
+// handshake over the live connection immediately afterwards, and the session it
+// wrote is only durable once that lands. Returning here killed the process
+// mid-handshake, so the phone dropped the device and the local row went stale.
+func (c *Client) finishPairing(ctx context.Context) error {
+	fmt.Fprintln(c.out, "\nCode accepted. Finishing the handshake, this takes a few seconds.")
+	wait := c.handshakeWait
+	if wait == nil {
+		wait = time.After
+	}
+	select {
+	case <-wait(handshakeGrace):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if c.pair.LinkedID() == nil {
+		return fmt.Errorf("handshake did not complete, run the command again")
+	}
+	return nil
 }
 
 // Disconnect closes the connection and shuts down the inference worker.

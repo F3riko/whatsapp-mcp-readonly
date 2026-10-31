@@ -89,6 +89,34 @@ docker run --rm -it --log-driver none --network host --user 10001:10001 \
 Then start the server again. `session_status` over MCP reports `paired` and
 `connected`; `/healthz` only proves the HTTP server is up.
 
+### Pairing by phone number instead of a QR code
+
+`login --phone-stdin` links by an eight-character code typed on the phone, which
+needs no camera. The number goes in on **stdin only**: never as an argument or
+environment variable, and never in a file, so it is not in `docker inspect`, the
+process table or shell history. Use a pipe, not `-t` (the number must not be
+echoed to a terminal), keep stderr on your terminal, and keep `--log-driver none`,
+because the printed `PAIR-CODE:` line is a live linking credential:
+
+```sh
+read -rs -p 'Number to link, as +<country code><number>: ' PHONE; echo
+printf '%s\n' "$PHONE" | docker run --rm -i --log-driver none --network host --user 10001:10001 \
+  -v <data volume>:/data \
+  --entrypoint /usr/local/bin/whatsapp-mcp <image> login --phone-stdin --data-dir /data \
+  --device-name "WhatsApp MCP read-only"
+unset PHONE
+```
+
+(`printf` is a shell builtin, so the number never appears in another process's
+arguments.) Run it with the server stopped and a single owner at the keyboard.
+The container prints `PAIR-CODE: XXXX-XXXX`; on the phone choose Settings, Linked
+Devices, Link a Device, then **Link with phone number instead**, and enter it.
+The code expires with the connection, about 160 seconds, and is requested exactly
+once; on expiry or failure the command exits non-zero and you rerun it for a new
+one. It refuses an already linked volume without touching it, and it succeeds
+only after the same 15 second handshake wait the QR flow uses. `serve` can never
+start pairing, with or without this flag.
+
 ## Checks
 
 ```sh
@@ -97,6 +125,7 @@ deploy/docker/smoke.sh <image> [<commit>]                       # needs Docker o
 ```
 
 `smoke.sh` uses throwaway volumes and a placeholder token. It checks platform and
-user, `--allow-send` rejection, volume inheritance, token preflight, the
-unpaired idle behaviour, clean stop, and offline decoding through the adapter for
-both models. It does not pair, and it does not prove transcription accuracy.
+user, `--allow-send` rejection, that `--phone-stdin` is login-only and rejects bad
+or argv-supplied numbers without echoing them or touching the volume, volume
+inheritance, token preflight, the unpaired idle behaviour, clean stop, and
+offline decoding through the adapter for both models. It does not pair, and it does not prove transcription accuracy.
